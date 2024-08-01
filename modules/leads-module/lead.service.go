@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"encoding/base64"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"github.com/go-gota/gota/dataframe"
@@ -16,6 +17,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"time"
 )
 
 func Run() error {
@@ -23,25 +27,74 @@ func Run() error {
 	if err := database.DB.Where("file_name = ?", "files-20230730.csv.tar.gz").First(&leadFile).Error; err != nil {
 		return err
 	}
-	//if err := downloadAnSplitFile(leadFile, 3); err != nil {
-	//	return err
-	//}
-	//if err := mergeFileDownloaded(leadFile.FileName, 3); err != nil {
-	//	return err
-	//}
-	//result, err := extractTarGz("storage/tmp/files-20230730.csv.tar.gz", "storage/tmp")
-	//if err != nil {
-	//	log.Println(err)
-	//}
-	//fmt.Println(result)
-	readCsv("storage/tmp/files-20230730.csv")
+	if err := downloadAnSplitFile(leadFile, 3); err != nil {
+		return err
+	}
+	if err := mergeFileDownloaded(leadFile.FileName, 3); err != nil {
+		return err
+	}
+	result, err := extractTarGz("storage/tmp/files-20230730.csv.tar.gz", "storage/tmp")
+	if err != nil {
+		log.Println(err)
+	}
+	resultCsv, err := readCsv(result[0], leadFile.FileName)
+	if err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 1) // Buffered channel to handle error propagation
+
+	// Run importLeadPhone
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := importLeadPhone((*resultCsv)[0], leadFile.FileName, 10000, 10000); err != nil {
+			errCh <- fmt.Errorf("error Phone Import: %v", err)
+		}
+	}()
+
+	// Run importLeadDomain
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := importLeadDomain((*resultCsv)[1], leadFile.FileName, 10000, 10000); err != nil {
+			errCh <- fmt.Errorf("error domain import: %v", err)
+		}
+	}()
+
+	// Run importLeadPhoneDuplicate
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := importLeadPhoneDuplicate((*resultCsv)[0], leadFile.FileName, 10000, 10000); err != nil {
+			errCh <- fmt.Errorf("error: %v", err)
+		} else {
+			fmt.Printf("Data import phone count duplicate completed\n")
+		}
+	}()
+
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(errCh) // Close the channel once all goroutines are done
+	}()
+
+	// Check if there were any errors
+	for err := range errCh {
+		fmt.Println(err)
+		return err // Exit if any error is encountered
+	}
+	if err = importLeadDomainRelations(result[0], leadFile.FileName, 10000, 30000); err != nil {
+		return err
+	}
+	cleanupFolder("storage/tmp/")
+	fmt.Println("All imports completed successfully")
 	return nil
 }
 func basicAuth(username, password string) string {
 	auth := username + ":" + password
 	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
-
 func downloadAnSplitFile(leadFile entities.LeadFileHistory, numChunks int) error {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", configs.FileServerUrl+"/"+leadFile.FileName, nil)
@@ -161,27 +214,6 @@ func cleanupFolder(folderPath string) {
 		log.Printf("failed to remove folder: %w", err)
 	}
 }
-func readCsv(filepath string) {
-	// Open the CSV file
-	f, err := os.Open(filepath)
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-	// Read the CSV file into a Gota DataFrame
-	df := dataframe.ReadCSV(f)
-
-	// Display the DataFrame (optional)
-	fmt.Println(df)
-	// Group by the phone number column and count occurrences
-	groupByPhone := df.GroupBy("phone")
-
-	// Filter to get only duplicates (count > 1)
-
-	// Display duplicate phone numbers and their counts
-	fmt.Println("Duplicate phone numbers and their counts:")
-	fmt.Println(groupByPhone)
-}
 func extractTarGz(tarGzFile, targetDir string) ([]string, error) {
 	var extractedFiles []string
 
@@ -247,218 +279,375 @@ func extractTarGz(tarGzFile, targetDir string) ([]string, error) {
 
 	return extractedFiles, nil
 }
+func readCsv(filepathCsv string, fileName string) (*[]string, error) {
+	// Open the CSV file
+	f, err := os.Open(filepathCsv)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	// Read the CSV file into a Gota DataFrame
+	df := dataframe.ReadCSV(f)
+	//Maps to count occurrences
+	phoneCount := make(map[string]int)
+	domainCount := make(map[string]int)
 
-// section import csv to database
-//const (
-//	batchSize  = 1000
-//	numWorkers = 10000 // Increase the number of workers
-//)
-//
-//// import v1
-//func importLead(filepath string) error {
-//	file, err := os.Open(filepath)
-//	if err != nil {
-//		return fmt.Errorf("unable to read input file %s: %v", filepath, err)
-//	}
-//	defer file.Close()
-//
-//	reader := csv.NewReader(file)
-//	records, err := reader.ReadAll()
-//	if err != nil {
-//		return fmt.Errorf("unable to parse file as CSV for %s: %v", filepath, err)
-//	}
-//
-//	const numWorkers = 10000
-//	var wg sync.WaitGroup
-//	recordCh := make(chan []string, len(records))
-//
-//	// Start worker goroutines
-//	for i := 0; i < numWorkers; i++ {
-//		wg.Add(1)
-//		go worker(&wg, recordCh)
-//	}
-//
-//	// Send records to the worker goroutines
-//	for _, record := range records {
-//		recordCh <- record
-//	}
-//	close(recordCh)
-//
-//	// Wait for all workers to finish
-//	wg.Wait()
-//
-//	return nil
-//}
-//func worker(wg *sync.WaitGroup, recordCh chan []string) {
-//	defer wg.Done()
-//	var batch []entities.LeadDomainRelations
-//	for record := range recordCh {
-//		if leadDomainRelation, err := processRecord(record); err == nil {
-//			batch = append(batch, leadDomainRelation)
-//			if len(batch) >= batchSize {
-//				if err := insertBatch(batch); err != nil {
-//					fmt.Printf("error inserting batch: %v\n", err)
-//				}
-//				batch = batch[:0]
-//			}
-//		} else {
-//			fmt.Printf("error processing record %v: %v\n", record, err)
-//		}
-//	}
-//	if len(batch) > 0 {
-//		if err := insertBatch(batch); err != nil {
-//			fmt.Printf("error inserting final batch: %v\n", err)
-//		}
-//	}
-//}
-//func processRecord(record []string) (entities.LeadDomainRelations, error) {
-//	var leadDomain entities.LeadDomains
-//	if err := database.DB.Where("name = ?", record[1]).First(&leadDomain).Error; err != nil {
-//		if errors.Is(err, gorm.ErrRecordNotFound) {
-//			leadDomain = entities.LeadDomains{Name: record[1]}
-//			if err := database.DB.Create(&leadDomain).Error; err != nil {
-//				return entities.LeadDomainRelations{}, err
-//			}
-//		} else {
-//			return entities.LeadDomainRelations{}, err
-//		}
-//	}
-//
-//	var lead entities.Leads
-//	if err := database.DB.Where("phone = ?", record[0]).First(&lead).Error; err != nil {
-//		if errors.Is(err, gorm.ErrRecordNotFound) {
-//			lead = entities.Leads{Phone: record[0]}
-//			if err := database.DB.Create(&lead).Error; err != nil {
-//				return entities.LeadDomainRelations{}, err
-//			}
-//		} else {
-//			return entities.LeadDomainRelations{}, err
-//		}
-//	}
-//
-//	leadDomainRelation := entities.LeadDomainRelations{
-//		LeadId:       lead.ID,
-//		LeadDomainId: leadDomain.ID,
-//	}
-//	return leadDomainRelation, nil
-//}
-//func insertBatch(batch []entities.LeadDomainRelations) error {
-//	return database.DB.Create(&batch).Error
-//}
+	// Iterate through the DataFrame rows
+	for i := 0; i < df.Nrow(); i++ {
+		phone := df.Elem(i, 0).String()
+		domain := df.Elem(i, 1).String()
 
-// import v2
-//func importLeadBuffer(filepath string) error {
-//	file, err := os.Open(filepath)
-//	if err != nil {
-//		return fmt.Errorf("unable to read input file %s: %v", filepath, err)
-//	}
-//	defer file.Close()
-//
-//	reader := csv.NewReader(bufio.NewReader(file))
-//	var wg sync.WaitGroup
-//	recordChan := make(chan []string, batchSize)
-//
-//	// Goroutine to read records and send to channel
-//	go func() {
-//		defer close(recordChan)
-//		for {
-//			record, err := reader.Read()
-//			if err != nil {
-//				if err.Error() == "EOF" {
-//					break
-//				}
-//				fmt.Println("Error reading record:", err)
-//				continue
-//			}
-//			recordChan <- record
-//		}
-//	}()
-//
-//	// Goroutine pool to process records concurrently
-//	for i := 0; i < numWorkers; i++ {
-//		wg.Add(1)
-//		go func() {
-//			defer wg.Done()
-//			batch := make([][]string, 0, batchSize)
-//			for record := range recordChan {
-//				batch = append(batch, record)
-//				if len(batch) >= batchSize {
-//					if err := saveBatch(batch); err != nil {
-//						fmt.Println("Error saving batch:", err)
-//					}
-//					batch = batch[:0]
-//				}
-//			}
-//			// Save remaining records
-//			if len(batch) > 0 {
-//				if err := saveBatch(batch); err != nil {
-//					fmt.Println("Error saving batch:", err)
-//				}
-//			}
-//		}()
-//	}
-//
-//	wg.Wait()
-//	return nil
-//}
-//func saveBatch(batch [][]string) error {
-//	log.Println("save migrating")
-//	return database.DB.Transaction(func(tx *gorm.DB) error {
-//		leadDomains := make(map[string]entities.LeadDomains)
-//		leads := make(map[string]entities.Leads)
-//
-//		// Collect unique lead domains and leads
-//		for _, record := range batch {
-//			if _, exists := leadDomains[record[1]]; !exists {
-//				leadDomains[record[1]] = entities.LeadDomains{Name: record[1]}
-//			}
-//			if _, exists := leads[record[0]]; !exists {
-//				leads[record[0]] = entities.Leads{Phone: record[0]}
-//			}
-//		}
-//
-//		// Bulk insert lead domains
-//		if len(leadDomains) > 0 {
-//			leadDomainsList := make([]entities.LeadDomains, 0, len(leadDomains))
-//			for _, ld := range leadDomains {
-//				leadDomainsList = append(leadDomainsList, ld)
-//			}
-//			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&leadDomainsList).Error; err != nil {
-//				return err
-//			}
-//		}
-//
-//		// Bulk insert leads
-//		if len(leads) > 0 {
-//			leadsList := make([]entities.Leads, 0, len(leads))
-//			for _, l := range leads {
-//				leadsList = append(leadsList, l)
-//			}
-//			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&leadsList).Error; err != nil {
-//				return err
-//			}
-//		}
-//
-//		// Create lead domain relations
-//		for _, record := range batch {
-//			var leadDomain entities.LeadDomains
-//			if err := tx.Where("name = ?", record[1]).First(&leadDomain).Error; err != nil {
-//				return err
-//			}
-//
-//			var lead entities.Leads
-//			if err := tx.Where("phone = ?", record[0]).First(&lead).Error; err != nil {
-//				return err
-//			}
-//
-//			leadDomainRelation := entities.LeadDomainRelations{
-//				LeadId:       lead.ID,
-//				LeadDomainId: leadDomain.ID,
-//			}
-//			if err := tx.Create(&leadDomainRelation).Error; err != nil {
-//				return err
-//			}
-//		}
-//		return nil
-//	})
-//}
+		// Count phone numbers
+		phoneCount[phone]++
+
+		// Count domains
+		domainCount[domain]++
+	}
+	dir := "storage/tmp"
+	phoneFilePath := filepath.Join(dir, fileName+"_phone_count.csv")
+	phoneFile, err := os.Create(phoneFilePath)
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return nil, err
+	}
+	defer phoneFile.Close()
+
+	phoneWriter := csv.NewWriter(phoneFile)
+	defer phoneWriter.Flush()
+
+	phoneWriter.Write([]string{"phone", "count_duplicate"})
+	for phone, count := range phoneCount {
+		err := phoneWriter.Write([]string{phone, fmt.Sprintf("%d", count)})
+		if err != nil {
+			fmt.Println("Error writing to file:", err)
+			return nil, err
+		}
+	}
+
+	// Write domain counts to a new CSV file
+	domainFilePath := filepath.Join(dir, fileName+"_domain_count.csv")
+	domainFile, err := os.Create(domainFilePath)
+	if err != nil {
+		fmt.Println("Error creating file:", err)
+		return nil, err
+	}
+	defer domainFile.Close()
+
+	domainWriter := csv.NewWriter(domainFile)
+	defer domainWriter.Flush()
+
+	domainWriter.Write([]string{"domain", "count_duplicate"})
+	for domain, count := range domainCount {
+		if count > 1 {
+			count-- // subtract 1 to reflect the count of duplicates
+		} else {
+			count = 0 // if no duplicates, set to 0
+		}
+		err := domainWriter.Write([]string{domain, fmt.Sprintf("%d", count)})
+		if err != nil {
+			fmt.Println("Error writing to file:", err)
+			return nil, err
+		}
+	}
+	result := []string{phoneFilePath, domainFilePath}
+	return &result, nil
+}
+func importLeadPhone(filepathPhoneCSV string, fileName string, chunkSize int, numWorkers int) error {
+	// Open the CSV file
+	file, err := os.Open(filepathPhoneCSV)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	createdAt := ExtractDateFromFilename(fileName)
+	// Read CSV data
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %v", err)
+	}
+
+	// Prepare data for insertion
+	var data []entities.Lead
+	phoneSet := make(map[string]struct{}) // To keep track of phones to avoid duplicates
+
+	for _, record := range records {
+		phone := record[0]
+		if _, exists := phoneSet[phone]; !exists {
+			phoneSet[phone] = struct{}{}
+			data = append(data, entities.Lead{
+				Phone:     phone,
+				CreatedAt: createdAt,
+			})
+		}
+	}
+
+	// Channel for sending data to workers
+	dataChan := make(chan []entities.Lead, numWorkers)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunk := range dataChan {
+				tx := database.DB.Begin()
+				if err := tx.Create(&chunk).Error; err != nil {
+					fmt.Println("Error inserting records:", err)
+					tx.Rollback()
+				} else {
+					tx.Commit()
+				}
+			}
+		}()
+	}
+
+	// Send data to workers in chunks
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		dataChan <- data[i:end]
+	}
+
+	// Close the channel and wait for workers to finish
+	close(dataChan)
+	wg.Wait()
+
+	fmt.Println("Data imported successfully.")
+	return nil
+}
+func importLeadDomain(filepathDomainCSV string, fileName string, chunkSize int, numWorkers int) error {
+	// Open the CSV file
+	file, err := os.Open(filepathDomainCSV)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	createdAt := ExtractDateFromFilename(fileName)
+	// Read CSV data
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %v", err)
+	}
+
+	// Prepare data for insertion
+	var data []entities.LeadDomain
+	domainSet := make(map[string]struct{}) // To keep track of phones to avoid duplicates
+
+	for _, record := range records {
+		domain := record[0]
+		if _, exists := domainSet[domain]; !exists {
+			domainSet[domain] = struct{}{}
+			data = append(data, entities.LeadDomain{
+				Name:      domain,
+				CreatedAt: createdAt,
+			})
+		}
+	}
+
+	// Channel for sending data to workers
+	dataChan := make(chan []entities.LeadDomain, numWorkers)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunk := range dataChan {
+				tx := database.DB.Begin()
+				if err := tx.Create(&chunk).Error; err != nil {
+					fmt.Println("Error inserting records:", err)
+					tx.Rollback()
+				} else {
+					tx.Commit()
+				}
+			}
+		}()
+	}
+
+	// Send data to workers in chunks
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		dataChan <- data[i:end]
+	}
+
+	// Close the channel and wait for workers to finish
+	close(dataChan)
+	wg.Wait()
+
+	fmt.Println("Data imported successfully.")
+	return nil
+}
+func importLeadPhoneDuplicate(filepathPhoneCSV string, fileName string, chunkSize int, numWorkers int) error {
+	// Open the CSV file
+	file, err := os.Open(filepathPhoneCSV)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	createdAt := ExtractDateFromFilename(fileName)
+	// Read CSV data
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %v", err)
+	}
+	log.Println("importing")
+	// Map to count occurrences
+	phoneCount := make(map[string]int)
+	for _, record := range records {
+		phone := record[0]
+		phoneCount[phone]++
+	}
+
+	// Prepare the data to be inserted
+	var data []entities.LeadPhoneDuplicateHistory
+	for phone, count := range phoneCount {
+		data = append(data, entities.LeadPhoneDuplicateHistory{
+			Phone:          phone,
+			DuplicateCount: count,
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		})
+	}
+
+	// Channel for sending data to workers
+	dataChan := make(chan []entities.LeadPhoneDuplicateHistory, numWorkers)
+
+	// WaitGroup to wait for all workers to finish
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunk := range dataChan {
+				if err := database.DB.Create(&chunk).Error; err != nil {
+					fmt.Println("Error inserting records:", err)
+				}
+			}
+		}()
+	}
+
+	// Send data to workers in chunks
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		dataChan <- data[i:end]
+	}
+
+	// Close the channel and wait for workers to finish
+	close(dataChan)
+	wg.Wait()
+
+	return nil
+}
+
+func importLeadDomainRelations(filepathMainCsv string, fileName string, chunkSize int, numWorkers int) error {
+	// Open the CSV file
+	file, err := os.Open(filepathMainCsv)
+	if err != nil {
+		return fmt.Errorf("error opening file: %v", err)
+	}
+	defer file.Close()
+
+	createdAt := ExtractDateFromFilename(fileName)
+	// Read CSV data
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return fmt.Errorf("error reading CSV file: %v", err)
+	}
+
+	jobs := make(chan [][]string, numWorkers)
+	results := make(chan error, numWorkers)
+	var wg sync.WaitGroup
+
+	// Worker pool
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunk := range jobs {
+				var leadDomainRelations []entities.LeadDomainRelations
+
+				for _, record := range chunk {
+					if len(record) < 2 {
+						continue // Skip invalid records
+					}
+
+					leadDomainRelations = append(leadDomainRelations, entities.LeadDomainRelations{
+						Phone:     record[0],
+						Domain:    record[1],
+						CreatedAt: createdAt,
+						UpdatedAt: createdAt,
+					})
+				}
+
+				if len(leadDomainRelations) > 0 {
+					if err := database.DB.CreateInBatches(leadDomainRelations, chunkSize).Error; err != nil {
+						results <- fmt.Errorf("error inserting data: %v", err)
+						return
+					}
+				}
+				results <- nil
+			}
+		}()
+	}
+
+	// Distribute the work to the workers
+	for i := 0; i < len(records); i += chunkSize {
+		end := i + chunkSize
+		if end > len(records) {
+			end = len(records)
+		}
+
+		jobs <- records[i:end]
+	}
+	close(jobs)
+
+	// Wait for all workers to finish and check results
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for err := range results {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ExtractDateFromFilename(filename string) time.Time {
+	// Split the filename to extract the date part
+	parts := strings.Split(filename, "-")
+	if len(parts) < 2 {
+		return time.Now()
+	}
+
+	dateStr := strings.Split(parts[1], ".")[0] // Extract '20230730'
+
+	// Parse the date string into a time.Time object
+	timestamp, err := time.Parse("20060102", dateStr)
+	if err != nil {
+		return time.Now()
+	}
+	return timestamp
+}
